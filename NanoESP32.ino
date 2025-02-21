@@ -249,6 +249,51 @@ String getLatestSessionId(String userId) {
     return "";
 }
 
+bool createClimbingRoute() {
+    if (WiFi.status() != WL_CONNECTED) {
+        Serial.println("WiFi Disconnected! Reconnecting...");
+        WiFi.reconnect();
+        return false;
+    }
+
+    HTTPClient http;
+    String requestURL = String(SUPABASE_BASE_URL) + "/climbing_routes";
+    if (DEBUG) Serial.println("\n[INFO] Creating climbing route entry: " + requestURL);
+
+    http.begin(requestURL);
+    http.addHeader("apikey", SUPABASE_API_KEY);
+    http.addHeader("Authorization", "Bearer " + String(SUPABASE_API_KEY));
+    http.addHeader("Content-Type", "application/json");
+    http.addHeader("Prefer", "return=minimal"); // Don't return the created record
+
+    // Create JSON payload
+    DynamicJsonDocument doc(1024);
+    doc["color"] = sensorColor;
+    doc["style"] = sensorStyle;
+    doc["user_id"] = currentUserId;
+    doc["session_id"] = currentSessionId;
+
+    String jsonString;
+    serializeJson(doc, jsonString);
+
+    if (DEBUG) Serial.println("[INFO] Request payload: " + jsonString);
+
+    int httpResponseCode = http.POST(jsonString);
+
+    if (httpResponseCode >= 200 && httpResponseCode < 300) {
+        if (DEBUG) Serial.println("[SUCCESS] Created climbing route entry");
+        http.end();
+        return true;
+    } else {
+        Serial.print("[ERROR] HTTP Error: ");
+        Serial.println(http.errorToString(httpResponseCode));
+        Serial.println("Response: " + http.getString());
+    }
+
+    http.end();
+    return false;
+}
+
 void processRFIDCard(String rfidTag) {
     // Step 1: Get user_id from RFID
     currentUserId = getUserIdFromRFID(rfidTag);
@@ -270,12 +315,19 @@ void processRFIDCard(String rfidTag) {
         return;
     }
 
+    // Step 4: Create climbing route entry
+    if (!createClimbingRoute()) {
+        Serial.println("[ERROR] Failed to create climbing route entry");
+        return;
+    }
+
     if (DEBUG) {
         Serial.println("\n=== Successfully processed RFID card ===");
         Serial.println("User ID: " + currentUserId);
         Serial.println("Session ID: " + currentSessionId);
         Serial.println("Sensor Color: " + sensorColor);
         Serial.println("Sensor Style: " + sensorStyle);
+        Serial.println("Climbing route entry created successfully");
         Serial.println("========================================\n");
     }
 }
