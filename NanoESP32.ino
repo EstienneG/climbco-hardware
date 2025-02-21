@@ -1,5 +1,9 @@
 #include <SPI.h>
 #include <MFRC522.h>
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
+#include "secrets.h"
 
 // Pin definitions for Nano ESP32
 #define SS_PIN   D5   // GPIO5
@@ -11,6 +15,16 @@ MFRC522 mfrc522(SS_PIN, RST_PIN);
 
 // Debug flag
 #define DEBUG true
+
+// Global variables for session data
+String currentUserId = "";
+String currentSessionId = "";
+String sensorColor = "";
+String sensorStyle = "";
+
+// Timer variables
+unsigned long lastRequestTime = 0;
+const long requestInterval = 2000; // 2 seconds
 
 void displayData(byte *buffer, byte bufferSize) {
     for (byte i = 0; i < bufferSize; i++) {
@@ -35,6 +49,16 @@ void setup() {
     SPI.begin(D8, D9, D10, D5);  // SCK, MISO, MOSI, SS (match wiring)
 
     mfrc522.PCD_Init();  // Init MFRC522
+
+    // Connect to WiFi
+    Serial.println("Connecting to WiFi...");
+    WiFi.begin(SSID, PASSWORD);
+
+    while (WiFi.status() != WL_CONNECTED) {
+        delay(500);
+        Serial.print(".");
+    }
+    Serial.println("\nWiFi Connected!");
 
     // Read and print RFID module software version
     byte v = mfrc522.PCD_ReadRegister(mfrc522.VersionReg);
@@ -71,17 +95,22 @@ void loop() {
     // Visual feedback
     digitalWrite(LED_PIN, HIGH);
 
-    // Show card details
+    // Convert UID to string
+    String rfidTag = "";
+    for (byte i = 0; i < mfrc522.uid.size; i++) {
+        if (mfrc522.uid.uidByte[i] < 0x10) rfidTag += "0";
+        rfidTag += String(mfrc522.uid.uidByte[i], HEX);
+    }
+    rfidTag.toUpperCase();
+
     if (DEBUG) {
         Serial.println(F("\n=== Card Detected! ==="));
         Serial.print(F("Card UID: "));
-        displayData(mfrc522.uid.uidByte, mfrc522.uid.size);
-        
-        // Get and print card type
-        MFRC522::PICC_Type piccType = mfrc522.PICC_GetType(mfrc522.uid.sak);
-        Serial.print(F("PICC Type: "));
-        Serial.println(mfrc522.PICC_GetTypeName(piccType));
+        Serial.println(rfidTag);
     }
+
+    // Process the RFID card
+    processRFIDCard(rfidTag);
 
     // Halt PICC
     mfrc522.PICC_HaltA();
@@ -91,4 +120,162 @@ void loop() {
     digitalWrite(LED_PIN, LOW);
     
     if (DEBUG) Serial.println(F("=== End of Card Reading ===\n"));
+}
+
+String getUserIdFromRFID(String rfidTag) {
+    if (WiFi.status() != WL_CONNECTED) {
+        Serial.println("WiFi Disconnected! Reconnecting...");
+        WiFi.reconnect();
+        return "";
+    }
+
+    HTTPClient http;
+    String requestURL = String(SUPABASE_BASE_URL) + "/bracelets?rfid=eq." + rfidTag + "&select=user_id";
+    if (DEBUG) Serial.println("\n[INFO] Querying bracelets table: " + requestURL);
+
+    http.begin(requestURL);
+    http.addHeader("apikey", SUPABASE_API_KEY);
+    http.addHeader("Authorization", "Bearer " + String(SUPABASE_API_KEY));
+    http.addHeader("Content-Type", "application/json");
+
+    int httpResponseCode = http.GET();
+
+    if (httpResponseCode > 0) {
+        String response = http.getString();
+        if (DEBUG) Serial.println("[INFO] Bracelets Response: " + response);
+
+        DynamicJsonDocument doc(1024);
+        DeserializationError error = deserializeJson(doc, response);
+
+        if (!error && doc.size() > 0) {
+            String userId = doc[0]["user_id"];
+            if (DEBUG) Serial.println("[SUCCESS] Found user_id: " + userId);
+            http.end();
+            return userId;
+        } else {
+            Serial.println("[ERROR] No bracelet found with RFID: " + rfidTag);
+        }
+    } else {
+        Serial.print("[ERROR] HTTP Error: ");
+        Serial.println(http.errorToString(httpResponseCode));
+    }
+
+    http.end();
+    return "";
+}
+
+bool getSensorData() {
+    if (WiFi.status() != WL_CONNECTED) {
+        Serial.println("WiFi Disconnected! Reconnecting...");
+        WiFi.reconnect();
+        return false;
+    }
+
+    HTTPClient http;
+    String requestURL = String(SUPABASE_BASE_URL) + "/sensors?id=eq.1&select=color,style"; // id=eq.1 variable that has to be set for each sensor.
+    if (DEBUG) Serial.println("\n[INFO] Querying sensors table: " + requestURL);
+
+    http.begin(requestURL);
+    http.addHeader("apikey", SUPABASE_API_KEY);
+    http.addHeader("Authorization", "Bearer " + String(SUPABASE_API_KEY));
+    http.addHeader("Content-Type", "application/json");
+
+    int httpResponseCode = http.GET();
+
+    if (httpResponseCode > 0) {
+        String response = http.getString();
+        if (DEBUG) Serial.println("[INFO] Sensors Response: " + response);
+
+        DynamicJsonDocument doc(1024);
+        DeserializationError error = deserializeJson(doc, response);
+
+        if (!error && doc.size() > 0) {
+            sensorColor = doc[0]["color"].as<String>();
+            sensorStyle = doc[0]["style"].as<String>();
+            if (DEBUG) Serial.println("[SUCCESS] Found sensor data - Color: " + sensorColor + ", Style: " + sensorStyle);
+            http.end();
+            return true;
+        } else {
+            Serial.println("[ERROR] No sensor data found with id=1");
+        }
+    } else {
+        Serial.print("[ERROR] HTTP Error: ");
+        Serial.println(http.errorToString(httpResponseCode));
+    }
+
+    http.end();
+    return false;
+}
+
+String getLatestSessionId(String userId) {
+    if (WiFi.status() != WL_CONNECTED) {
+        Serial.println("WiFi Disconnected! Reconnecting...");
+        WiFi.reconnect();
+        return "";
+    }
+
+    HTTPClient http;
+    String requestURL = String(SUPABASE_BASE_URL) + "/climbing_sessions?user_id=eq." + userId + "&order=created_at.desc&limit=1";
+    if (DEBUG) Serial.println("\n[INFO] Querying climbing_sessions table: " + requestURL);
+
+    http.begin(requestURL);
+    http.addHeader("apikey", SUPABASE_API_KEY);
+    http.addHeader("Authorization", "Bearer " + String(SUPABASE_API_KEY));
+    http.addHeader("Content-Type", "application/json");
+
+    int httpResponseCode = http.GET();
+
+    if (httpResponseCode > 0) {
+        String response = http.getString();
+        if (DEBUG) Serial.println("[INFO] Climbing Sessions Response: " + response);
+
+        DynamicJsonDocument doc(1024);
+        DeserializationError error = deserializeJson(doc, response);
+
+        if (!error && doc.size() > 0) {
+            String sessionId = doc[0]["id"];
+            if (DEBUG) Serial.println("[SUCCESS] Found session_id: " + sessionId);
+            http.end();
+            return sessionId;
+        } else {
+            Serial.println("[ERROR] No active session found for user_id: " + userId);
+        }
+    } else {
+        Serial.print("[ERROR] HTTP Error: ");
+        Serial.println(http.errorToString(httpResponseCode));
+    }
+
+    http.end();
+    return "";
+}
+
+void processRFIDCard(String rfidTag) {
+    // Step 1: Get user_id from RFID
+    currentUserId = getUserIdFromRFID(rfidTag);
+    if (currentUserId.length() == 0) {
+        Serial.println("[ERROR] Failed to get user_id from RFID");
+        return;
+    }
+
+    // Step 2: Get sensor data
+    if (!getSensorData()) {
+        Serial.println("[ERROR] Failed to get sensor data");
+        return;
+    }
+
+    // Step 3: Get latest session_id
+    currentSessionId = getLatestSessionId(currentUserId);
+    if (currentSessionId.length() == 0) {
+        Serial.println("[ERROR] Failed to get session_id");
+        return;
+    }
+
+    if (DEBUG) {
+        Serial.println("\n=== Successfully processed RFID card ===");
+        Serial.println("User ID: " + currentUserId);
+        Serial.println("Session ID: " + currentSessionId);
+        Serial.println("Sensor Color: " + sensorColor);
+        Serial.println("Sensor Style: " + sensorStyle);
+        Serial.println("========================================\n");
+    }
 }
