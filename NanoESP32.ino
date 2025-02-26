@@ -5,6 +5,10 @@
 #include <ArduinoJson.h>
 #include "secrets.h"
 
+// Deep sleep parameters
+#define uS_TO_S_FACTOR 1000000ULL  // Conversion factor for micro seconds to seconds
+#define TIME_TO_SLEEP  5          // Time ESP32 will go to sleep (in seconds)
+
 // Pin definitions for Nano ESP32
 #define SS_PIN   D5   // GPIO5
 #define RST_PIN  D4   // GPIO4
@@ -34,11 +38,26 @@ void displayData(byte *buffer, byte bufferSize) {
     Serial.println();
 }
 
+void print_wakeup_reason() {
+    esp_sleep_wakeup_cause_t wakeup_reason = esp_sleep_get_wakeup_cause();
+    
+    if (DEBUG) {
+        switch(wakeup_reason) {
+            case ESP_SLEEP_WAKEUP_EXT0 : Serial.println("Wakeup caused by external signal using RTC_IO"); break;
+            case ESP_SLEEP_WAKEUP_TIMER : Serial.println("Wakeup caused by timer"); break;
+            default : Serial.printf("Wakeup was not caused by deep sleep: %d\n", wakeup_reason); break;
+        }
+    }
+}
+
 void setup() {
     Serial.begin(115200);    // Initialize serial communications
     while (!Serial && millis() < 3000) {
         ; // Wait for serial port to connect, timeout after 3 seconds
     }
+    
+    // Print the wakeup reason for ESP32
+    print_wakeup_reason();
 
     if (DEBUG) Serial.println(F("Initializing system..."));
 
@@ -69,11 +88,18 @@ void setup() {
     }
 
     if (DEBUG) Serial.println(F("System ready - Waiting for cards..."));
+    
+    // Configure the wake up source
+    // We use timer wake up for periodic RFID checking
+    esp_sleep_enable_timer_wakeup(TIME_TO_SLEEP * uS_TO_S_FACTOR);
+    if (DEBUG) Serial.println("Setup ESP32 to sleep for " + String(TIME_TO_SLEEP) + " Seconds");
 }
 
 void loop() {
+    static unsigned long loopStartTime = millis();
     static unsigned long lastDebugTime = 0;
     const unsigned long DEBUG_INTERVAL = 5000; // Debug message every 5 seconds
+    const unsigned long ACTIVE_TIME = 10000; // Stay active for 10 seconds after card detection
     
     // Periodic debug message
     if (DEBUG && (millis() - lastDebugTime > DEBUG_INTERVAL)) {
@@ -83,8 +109,18 @@ void loop() {
 
     // Look for new cards
     if (!mfrc522.PICC_IsNewCardPresent()) {
+        // If we've been active for more than ACTIVE_TIME and no card is present, go to sleep
+        if (millis() - loopStartTime > ACTIVE_TIME) {
+            if (DEBUG) Serial.println("Going to sleep now");
+            // Give some time for the serial output to complete
+            delay(100);
+            esp_deep_sleep_start();
+        }
         return;
     }
+    
+    // Reset the active time counter when a card is detected
+    loopStartTime = millis();
 
     // Select one of the cards
     if (!mfrc522.PICC_ReadCardSerial()) {
