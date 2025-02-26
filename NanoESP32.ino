@@ -6,13 +6,14 @@
 #include "secrets.h"
 
 // Deep sleep parameters
-#define uS_TO_S_FACTOR 1000000ULL  // Conversion factor for micro seconds to seconds
-#define TIME_TO_SLEEP  5          // Time ESP32 will go to sleep (in seconds)
+#define WAKE_UP_PIN GPIO_NUM_2    // GPIO2 (D2) for external wake up
+#define INACTIVITY_TIMEOUT 25000  // Time in ms before going to sleep
 
 // Pin definitions for Nano ESP32
 #define SS_PIN   D5   // GPIO5
 #define RST_PIN  D4   // GPIO4
-#define LED_PIN  D2   // Onboard LED (Optional)
+#define LED_PIN  D13  // LED pin
+#define IRQ_PIN  D2   // GPIO2 - IRQ pin from MFRC522
 
 // Create MFRC522 instance
 MFRC522 mfrc522(SS_PIN, RST_PIN);
@@ -43,9 +44,8 @@ void print_wakeup_reason() {
     
     if (DEBUG) {
         switch(wakeup_reason) {
-            case ESP_SLEEP_WAKEUP_EXT0 : Serial.println("Wakeup caused by external signal using RTC_IO"); break;
-            case ESP_SLEEP_WAKEUP_TIMER : Serial.println("Wakeup caused by timer"); break;
-            default : Serial.printf("Wakeup was not caused by deep sleep: %d\n", wakeup_reason); break;
+            case ESP_SLEEP_WAKEUP_EXT0 : Serial.println("Wakeup caused by RFID card detection"); break;
+            default : Serial.println("Power on reset"); break;
         }
     }
 }
@@ -89,17 +89,19 @@ void setup() {
 
     if (DEBUG) Serial.println(F("System ready - Waiting for cards..."));
     
-    // Configure the wake up source
-    // We use timer wake up for periodic RFID checking
-    esp_sleep_enable_timer_wakeup(TIME_TO_SLEEP * uS_TO_S_FACTOR);
-    if (DEBUG) Serial.println("Setup ESP32 to sleep for " + String(TIME_TO_SLEEP) + " Seconds");
+    // Configure external wake up on IRQ_PIN (GPIO3)
+    esp_sleep_enable_ext0_wakeup(WAKE_UP_PIN, 0); // Wake up when pin goes LOW
+    if (DEBUG) Serial.println("ESP32 configured to wake up when RFID card is detected");
+    
+    // Configure MFRC522 IRQ
+    pinMode(IRQ_PIN, INPUT_PULLUP);
+    mfrc522.PCD_WriteRegister(mfrc522.ComIEnReg, 0xA0); // Enable IRQ for card detection
 }
 
 void loop() {
-    static unsigned long loopStartTime = millis();
+    static unsigned long lastActivityTime = millis();
     static unsigned long lastDebugTime = 0;
     const unsigned long DEBUG_INTERVAL = 5000; // Debug message every 5 seconds
-    const unsigned long ACTIVE_TIME = 10000; // Stay active for 10 seconds after card detection
     
     // Periodic debug message
     if (DEBUG && (millis() - lastDebugTime > DEBUG_INTERVAL)) {
@@ -108,19 +110,19 @@ void loop() {
     }
 
     // Look for new cards
-    if (!mfrc522.PICC_IsNewCardPresent()) {
-        // If we've been active for more than ACTIVE_TIME and no card is present, go to sleep
-        if (millis() - loopStartTime > ACTIVE_TIME) {
-            if (DEBUG) Serial.println("Going to sleep now");
-            // Give some time for the serial output to complete
-            delay(100);
-            esp_deep_sleep_start();
+    if (mfrc522.PICC_IsNewCardPresent()) {
+        lastActivityTime = millis(); // Reset activity timer when card is detected
+    } else if (millis() - lastActivityTime > INACTIVITY_TIMEOUT) {
+        if (DEBUG) {
+            Serial.println("No activity for 10 seconds, entering deep sleep");
+            Serial.println("Will wake up when RFID card is detected");
+            delay(100); // Give time for serial to complete
         }
+        digitalWrite(LED_PIN, LOW); // Turn off LED
+        esp_deep_sleep_start();
+    } else {
         return;
     }
-    
-    // Reset the active time counter when a card is detected
-    loopStartTime = millis();
 
     // Select one of the cards
     if (!mfrc522.PICC_ReadCardSerial()) {
